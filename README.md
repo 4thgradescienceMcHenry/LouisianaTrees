@@ -1,5 +1,3 @@
-# LouisianaTrees
-Trees around Louisiana
 <!doctype html>
 <html lang="en">
 <head>
@@ -65,6 +63,7 @@ textarea{resize:vertical;min-height:64px}
 input:focus,select:focus,textarea:focus,button:focus-visible{outline:3px solid var(--accent);outline-offset:1px}
 .help{font-size:13px;color:var(--muted);margin-top:4px}
 .drop{border:2px dashed var(--line);border-radius:14px;padding:14px;text-align:center;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:8px}
+.vh{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0)}
 .drop img{max-height:180px;border-radius:10px}
 .btn{font:700 16px var(--body);border:0;border-radius:12px;padding:12px 16px;cursor:pointer;background:var(--pin);color:var(--pin-ring)}
 .btn.ghost{background:transparent;color:var(--ink);border:1.5px solid var(--line)}
@@ -115,7 +114,8 @@ input:focus,select:focus,textarea:focus,button:focus-visible{outline:3px solid v
 
       <div id="viewAdd">
         <div id="addGate" class="notice" hidden></div>
-        <form id="form" novalidate>
+        <div id="nojs" class="notice" style="border:2px solid var(--danger)"><b>This page can’t save trees here.</b> It’s being shown in a preview that turns off the map’s buttons. Download the file, then open it in Chrome, Edge, or Safari, or use the class map link from your teacher.</div>
+        <form id="form" novalidate action="#" onsubmit="return false">
           <div style="display:flex;flex-direction:column;gap:12px">
             <div class="safety">📸 Take a picture of just the tree. No faces, no house numbers, and use your <b>first name only</b>.</div>
             <div class="field">
@@ -146,10 +146,10 @@ input:focus,select:focus,textarea:focus,button:focus-visible{outline:3px solid v
                 <img id="preview" alt="" hidden>
                 <span id="dropText">Tap to choose a photo</span>
               </label>
-              <input type="file" id="fPhoto" accept="image/*" hidden>
+              <input type="file" id="fPhoto" accept="image/*" class="vh">
             </div>
             <div class="row">
-              <button class="btn" id="submit" type="submit">Put my tree on the map</button>
+              <button class="btn" id="submit" type="submit" disabled>Loading the map…</button>
               <button class="btn danger" id="removeMine" type="button" hidden>Remove my tree</button>
             </div>
             <p class="msg" id="msg" role="status"></p>
@@ -197,12 +197,21 @@ const tempLayer = el("g", {}, svg);
 
 // ---- state ----
 let trees = [];            // [{id, ...data}]
-let myId = null, owner = false, db = null, assets = null, canWrite = false;
+let myId = null, owner = false, db = null, assets = null, canWrite = false, local = false;
+const LKEY = "la-tree-map-v1";
+function loadLocal(){ try { return JSON.parse(localStorage.getItem(LKEY) || "[]"); } catch { return []; } }
+function saveLocal(){ try { localStorage.setItem(LKEY, JSON.stringify(trees)); return true; } catch { return false; } }
+function blobToDataUrl(b){ return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(b); }); }
+function startLocal(msg){ local = true; owner = true; canWrite = true; trees = loadLocal(); gate(msg); renderPins(); renderAll(); }
 let photoBlob = null, customPt = null, picking = false, selectedKey = null;
 
 const normCity = s => (s || "").trim().replace(/\s+/g, " ");
 const cityKey = s => normCity(s).toLowerCase();
-const findCity = s => { const k = cityKey(s); for (const n in CITIES) if (n.toLowerCase() === k) return n; return null; };
+const findCity = s => { const k = cityKey(s).replace(/^st\.? /, "st. ").replace(/,?\s*(la|louisiana)$/, "").trim(); if (!k) return null;
+  for (const n in CITIES) if (n.toLowerCase() === k) return n;
+  for (const n in CITIES) if (n.toLowerCase().replace(/[^a-z]/g, "") === k.replace(/[^a-z]/g, "")) return n;
+  const starts = Object.keys(CITIES).filter(n => n.toLowerCase().startsWith(k)); if (k.length >= 4 && starts.length === 1) return starts[0];
+  return null; };
 const dl = $("cityList"); Object.keys(CITIES).sort().forEach(n => { const o = document.createElement("option"); o.value = n; dl.appendChild(o); });
 
 function groups() {
@@ -274,13 +283,14 @@ function showCity(key) {
     const k = document.createElement("span"); k.className = "kind"; k.textContent = t.kind || "";
     m.append(w, k);
     if (t.note) { const n = document.createElement("span"); n.className = "note"; n.textContent = t.note; m.appendChild(n); }
-    if (owner && t.id !== myId) {
+    if (owner && (local || t.id !== myId)) {
       const del = document.createElement("button"); del.className = "btn danger"; del.type = "button"; del.textContent = "Remove";
       let armed = false;
       del.onclick = async () => {
         if (!armed) { armed = true; del.textContent = "Tap again to remove"; return; }
         del.disabled = true;
-        try { await db.collection("trees").doc(t.id).delete(); if (t.assetId && assets) assets.delete(t.assetId).catch(() => {}); }
+        try { if (local) { trees = trees.filter(x => x.id !== t.id); saveLocal(); renderPins(); showCity(key); return; }
+          await db.collection("trees").doc(t.id).delete(); if (t.assetId && assets) assets.delete(t.assetId).catch(() => {}); }
         catch (e) { del.textContent = "Couldn’t remove"; }
       };
       m.appendChild(del);
@@ -312,56 +322,84 @@ $("fCity").addEventListener("input", () => {
 });
 
 // ---- photo ----
+let photoDataUrl = null;
 $("fPhoto").addEventListener("change", async () => {
   const f = $("fPhoto").files[0]; if (!f) return;
-  try { photoBlob = await shrink(f); const u = URL.createObjectURL(photoBlob); $("preview").src = u; $("preview").hidden = false; $("dropText").textContent = "Tap to choose a different photo"; }
-  catch { photoBlob = null; say("That file didn’t work as a photo. Try a JPG or PNG.", true); }
+  say("Loading your photo…");
+  try {
+    photoDataUrl = await blobToDataUrl(f);
+    try { photoBlob = await shrink(photoDataUrl, 1100); photoDataUrl = await blobToDataUrl(photoBlob); }
+    catch { if (f.size > 8 * 1024 * 1024) throw new Error("big"); photoBlob = f; }
+    $("preview").src = photoDataUrl; $("preview").hidden = false;
+    $("dropText").textContent = "Tap to choose a different photo"; say("Photo ready! ✔");
+  } catch (e) {
+    photoBlob = null; photoDataUrl = null;
+    say(e && e.message === "big" ? "That photo is too big. Try a smaller one or take a screenshot of it." : "That file didn’t work as a photo. Try a JPG or PNG.", true);
+  }
 });
-function shrink(file) {
-  return new Promise((res, rej) => {
-    const img = new Image(); const u = URL.createObjectURL(file);
-    img.onload = () => {
-      const max = 1100, s = Math.min(1, max / Math.max(img.width, img.height));
-      const c = document.createElement("canvas"); c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
-      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height); URL.revokeObjectURL(u);
-      c.toBlob(b => b ? res(b) : rej(), "image/jpeg", 0.82);
-    };
-    img.onerror = rej; img.src = u;
-  });
+function loadImg(src) { return new Promise((res, rej) => { const img = new Image(); img.onload = () => res(img); img.onerror = rej; img.src = src; }); }
+async function shrink(src, maxSide) {
+  let w, h, draw;
+  try { const bmp = await createImageBitmap(typeof src === "string" ? await (await fetch(src)).blob() : src); w = bmp.width; h = bmp.height; draw = bmp; }
+  catch { const img = await loadImg(typeof src === "string" ? src : await blobToDataUrl(src)); w = img.naturalWidth; h = img.naturalHeight; draw = img; }
+  if (!w || !h) throw new Error("decode");
+  const s = Math.min(1, (maxSide || 1100) / Math.max(w, h));
+  const c = document.createElement("canvas"); c.width = Math.round(w * s); c.height = Math.round(h * s);
+  c.getContext("2d").drawImage(draw, 0, 0, c.width, c.height);
+  const d = c.toDataURL("image/jpeg", 0.82);
+  const bin = atob(d.split(",")[1]); const u8 = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new Blob([u8], {type: "image/jpeg"});
 }
+function shrinkBlob(b, max) { return shrink(b, max); }
 
-function say(t, err) { const m = $("msg"); m.textContent = t; m.className = "msg" + (err ? " err" : ""); }
+function say(t, err, field) { const m = $("msg"); m.textContent = t; m.className = "msg" + (err ? " err" : ""); try { m.scrollIntoView({block: "nearest", behavior: "smooth"}); } catch {} if (field) { const f = $(field); f.style.borderColor = "var(--danger)"; f.focus(); setTimeout(() => f.style.borderColor = "", 2500); } }
 
 // ---- submit ----
+async function addLocal(entry, note) {
+  let url; try { url = await blobToDataUrl(await shrinkBlob(photoBlob, 700)); } catch { url = photoDataUrl; }
+  trees.push(Object.assign({id: "l" + Date.now(), photoUrl: url, createdAt: Date.now()}, entry));
+  const ok = saveLocal(); renderPins();
+  resetForm();
+  say((note ? note + " " : "") + (ok ? "Tree added to the map! 🌳 Next student can add theirs." : "Tree added to the map! 🌳 (It will disappear if this page is closed.)"));
+}
+function resetForm() { $("form").reset(); $("preview").hidden = true; $("dropText").textContent = "Tap to choose a photo"; photoBlob = null; photoDataUrl = null; customPt = null; drawTemp(); setPicking(false); $("cityHelp").textContent = "Pick your town from the list. Not there? Type it, then tap the map near it."; }
+const LA_CENTER = [31.0, -92.0];
 $("form").addEventListener("submit", async e => {
   e.preventDefault();
-  if (!db || !canWrite) { say("This page can’t save right now. Ask your teacher for access.", true); return; }
   const name = normCity($("fName").value), cityRaw = normCity($("fCity").value);
   const known = findCity(cityRaw);
-  if (!name) return say("Type your first name.", true);
-  if (!cityRaw) return say("Type your town or city.", true);
-  if (!known && !customPt) { setPicking(true); return say("Tap the map near your town so we can place your pin.", true); }
-  if (!photoBlob && !mine()) return say("Choose a photo of your tree.", true);
+  if (!name) return say("Type your first name first.", true, "fName");
+  if (!cityRaw) return say("Type your town or city.", true, "fCity");
+  // read the photo now if the 'change' event never fired
+  if (!photoBlob && $("fPhoto").files && $("fPhoto").files[0]) {
+    const f = $("fPhoto").files[0];
+    try { photoDataUrl = await blobToDataUrl(f); try { photoBlob = await shrink(photoDataUrl, 1100); } catch { photoBlob = f; } } catch {}
+  }
+  if (!photoBlob && (local || !mine())) return say("Choose a photo of your tree (tap the photo box).", true, "drop");
+  const pt = known ? CITIES[known] : (customPt || LA_CENTER);
+  const unplaced = !known && !customPt;
+  const entry = {name: name.slice(0, 20), city: (known || cityRaw).slice(0, 40), lat: pt[0], lon: pt[1], kind: $("fKind").value, note: normCity($("fNote").value).slice(0, 140)};
+  const placeNote = unplaced ? "We didn’t find that town, so your pin is in the middle of the state." : "";
   const btn = $("submit"); btn.disabled = true; say("Planting your tree on the map…");
   try {
+    if (local || !db || !canWrite || !myId) {
+      await addLocal(entry, (!local ? "Saved on this device only — ask your teacher for edit access to add it to the class map." : "") + (placeNote ? " " + placeNote : ""));
+      return;
+    }
     const prev = mine();
     let assetId = prev && prev.assetId, photoUrl = prev && prev.photoUrl;
     if (photoBlob) {
-      if (!assets) throw {message: "Photo uploads aren’t turned on for you. Ask your teacher."};
-      const up = await assets.upload(photoBlob, {type: "image/jpeg"});
+      if (!assets) throw {message: "Photo uploads aren’t turned on for you."};
+      const up = await assets.upload(photoBlob, {type: photoBlob.type || "image/jpeg"});
       assetId = up.id; photoUrl = up.url;
     }
-    const [lat, lon] = known ? CITIES[known] : customPt;
-    await db.collection("trees").doc(myId).set({
-      name: name.slice(0, 20), city: (known || cityRaw).slice(0, 40), lat, lon,
-      kind: $("fKind").value, note: normCity($("fNote").value).slice(0, 140),
-      assetId: assetId || "", photoUrl: photoUrl || "", createdAt: Date.now()
-    });
+    await db.collection("trees").doc(myId).set(Object.assign({}, entry, {assetId: assetId || "", photoUrl: photoUrl || "", createdAt: Date.now()}));
     if (prev && prev.assetId && prev.assetId !== assetId && assets) assets.delete(prev.assetId).catch(() => {});
-    photoBlob = null; customPt = null; drawTemp();
-    say("Your tree is on the map! 🌳");
+    photoBlob = null; customPt = null; drawTemp(); setPicking(false);
+    say("Your tree is on the class map! 🌳 " + placeNote);
   } catch (err) {
-    say((err && err.code === "too_large") ? "That photo is too big. Try another one." : (err && err.message) || "Something went wrong. Try again in a minute.", true);
+    const why = (err && err.code === "too_large") ? "That photo was too big for the class map." : (err && err.code === "unsupported_type") ? "That kind of photo can’t go on the class map." : "The class map couldn’t save it" + (err && err.code ? " (" + err.code + ")" : "") + ".";
+    try { await addLocal(entry, why + " It’s saved on this device for now."); } catch { say(why + " Try again in a minute.", true); }
   } finally { btn.disabled = false; }
 });
 
@@ -381,18 +419,21 @@ $("removeMine").onclick = async () => {
   catch { say("Couldn’t remove it. Try again.", true); }
 };
 
-function gate(text) { const g = $("addGate"); g.textContent = text; g.hidden = !text; $("form").hidden = !!text; }
+function gate(text) { const g = $("addGate"); g.textContent = text; g.hidden = !text; }
 
 renderPins(); renderAll();
-gate("Loading the class map…");
+gate("");
+$("nojs").hidden = true; $("submit").disabled = false; $("submit").textContent = "Put my tree on the map";
 
 // ---- capabilities ----
 (async () => {
   const c = window.claude;
-  if (!c || !c.use) { gate("Open this page from your class link to add your tree."); return; }
+  if (c && c.use) { local = true; owner = true; trees = loadLocal(); renderPins(); }
+  if (!c || !c.use) { startLocal("Classroom mode: trees added here are saved on this computer only. To share one map with all students, use the Claude class link."); return; }
   const [dbNs, user, as] = await Promise.all([c.use("db"), c.use("user"), c.use("assets")]);
   db = dbNs; assets = as;
-  if (!db) { gate("Sign in to Claude with the account your teacher shared this map with to see and add trees."); return; }
+  if (db) { local = false; owner = false; trees = []; }
+  if (!db) { startLocal("You’re not signed in, so trees you add are saved on this device only. Sign in with the account your teacher shared the map with to add yours to the class map."); return; }
   if (user) { myId = await user.id(); owner = await user.isOwner(); const cw = await user.can("data.write"); canWrite = cw !== false; }
   if (!myId) { gate("Sign in to add your tree. You can still look at everyone’s trees."); }
   else if (!canWrite) gate("You can look at the trees, but adding one needs edit access. Ask your teacher.");
